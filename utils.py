@@ -21,6 +21,7 @@ from scipy.ndimage.interpolation import zoom
 from scipy.ndimage import imread
 from sklearn.metrics import confusion_matrix
 import bcolz
+import h5py
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.manifold import TSNE
 
@@ -180,6 +181,15 @@ def append_array(c, arr):
 def load_array(fname):
     return bcolz.open(fname)[:]
 
+def save_aug_features(model, fname, batches, epoch_size, num_epochs=10):
+    shape = model.layers[-1].output_shape
+    f = h5py.File(fname, 'w')
+    dset = f.create_dataset("features", (0,)+shape[1:], 
+                            maxshape=shape, compression="gzip")
+    for i in range(num_epochs):
+        conv_trn_feat = model.predict_generator(batches, val_samples=epoch_size)
+        dset.resize(dset.shape[0]+epoch_size, axis=0)
+        dset[-epoch_size:,] = conv_trn_feat
 
 def mk_size(img, r2c):
     r,c,_ = img.shape
