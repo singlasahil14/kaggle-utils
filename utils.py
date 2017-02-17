@@ -7,6 +7,7 @@ from matplotlib import pyplot as plt
 from operator import itemgetter, attrgetter, methodcaller
 from collections import OrderedDict
 import itertools
+import shutil
 from itertools import chain
 
 import pandas as pd
@@ -20,7 +21,7 @@ from scipy import misc, ndimage
 from scipy.ndimage.interpolation import zoom
 from scipy.ndimage import imread
 from sklearn.metrics import confusion_matrix
-import bcolz
+#import bcolz
 import h5py
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.manifold import TSNE
@@ -36,8 +37,9 @@ import keras
 from keras import backend as K
 from keras.utils.data_utils import get_file
 from keras.utils import np_utils
+from keras.utils.io_utils import HDF5Matrix
 from keras.utils.np_utils import to_categorical
-from keras.models import Sequential, Model
+from keras.models import Sequential, Model, load_model
 from keras.layers import Input, Embedding, Reshape, merge, LSTM, Bidirectional
 from keras.layers import TimeDistributed, Activation, SimpleRNN, GRU
 from keras.layers.core import Flatten, Dense, Dropout, Lambda
@@ -47,7 +49,7 @@ from keras.optimizers import SGD, RMSprop, Adam
 from keras.utils.layer_utils import layer_from_config
 from keras.metrics import categorical_crossentropy, categorical_accuracy
 from keras.layers.convolutional import *
-#from keras.callbacks import ReduceLROnPlateau
+from keras.callbacks import ReduceLROnPlateau, ModelCheckpoint
 from keras.preprocessing import image, sequence
 from keras.preprocessing.text import Tokenizer
 
@@ -174,22 +176,143 @@ def save_array(fname, arr):
     c=bcolz.carray(arr, rootdir=fname, mode='w')
     c.flush()
 
-def append_array(c, arr):
-    c.append(arr)
-    c.flush()
 
 def load_array(fname):
     return bcolz.open(fname)[:]
 
-def save_aug_features(model, fname, batches, epoch_size, num_epochs=10):
-    shape = model.layers[-1].output_shape
-    f = h5py.File(fname, 'w')
-    dset = f.create_dataset("features", (0,)+shape[1:], 
-                            maxshape=shape, compression="gzip")
-    for i in range(num_epochs):
-        conv_trn_feat = model.predict_generator(batches, val_samples=epoch_size)
-        dset.resize(dset.shape[0]+epoch_size, axis=0)
-        dset[-epoch_size:,] = conv_trn_feat
+def load_array_partial(fname, start=0, end=1000):
+    c=bcolz.open(fname)
+    return c[start:end]
+
+def append_array(arr, data):
+    size = len(data)
+    arr.resize(arr.shape[0]+size, axis=0)
+    arr[-size:,] = data
+
+def create_arrays(f, names, shapes):
+    if(len(shapes)!=len(names)):
+        raise ValueError('shapes and names should have same length. '
+                         'Found: len(shapes) = %s, len(names) = %s' %
+                         (len(shapes), len(names)))
+    dsets = []
+    for name, shape in zip(names, shapes):
+        dsets.append(f.create_dataset(name, (0,)+shape[1:], maxshape=(None,)+shape[1:]))
+    return tuple(dsets)
+
+def gen_batches(feat, labels, batch_size=32, epoch_size=None):
+    if epoch_size is None:
+        epoch_size = len(labels)
+    start = 0
+    while True:
+        epoch_start = start % epoch_size
+        curr_size = min(batch_size, epoch_size - epoch_start)
+        stop = min(start + curr_size, len(labels))
+        yield feat[start:stop], labels[start:stop]
+        start = stop % (len(labels))
+
+def get_batches(datagen):
+    batch_size = datagen.batch_size
+    for i in range(0, datagen.n, batch_size):
+        yield datagen.next()
+
+class FeatureSaver():
+    def __init__(self, train_datagen, valid_datagen=None, test_datagen=None):
+        self.train_datagen = train_datagen
+        self.valid_datagen = valid_datagen
+        self.test_datagen = test_datagen
+        self.nb_classes = self.get_nb_classes()
+    
+    def get_nb_classes(self):
+        class_name = self.train_datagen.__class__.__name__
+        if(class_name=='DirectoryIterator'):
+            return (self.train_datagen.nb_class,)
+        else:
+            return self.train_datagen.y.shape[1:]
+
+    def run_epoch(self, datagen, model, feat_dset, label_dset=None):
+        for tup in get_batches(datagen):
+            features = model.predict_on_batch(tup[0])
+            append_array(feat_dset, features)
+            if((len(tup)>1) and (label_dset!=None)):
+                append_array(label_dset, tup[1])
+
+    def save_train(self, model, f, num_epochs=10):
+        datagen = self.train_datagen
+
+        data_shape = model.layers[-1].output_shape
+        label_shape = (None,)+self.nb_classes
+        feat_dset, label_dset = create_arrays(f, ['train_features', 'train_labels'],
+                                              [data_shape, label_shape])
+
+        for i in range(num_epochs):
+            self.run_epoch(datagen, model, feat_dset, label_dset)
+
+    def save_valid(self, model, f):
+        datagen = self.valid_datagen
+
+        data_shape = model.layers[-1].output_shape
+        label_shape = (None,)+self.nb_classes
+        feat_dset, label_dset = create_arrays(f, ['valid_features', 'valid_labels'],
+                                              [data_shape, label_shape])
+        self.run_epoch(datagen, model, feat_dset, label_dset)
+
+    def save_test(self, model, f):
+        datagen = self.test_datagen
+
+        data_shape = model.layers[-1].output_shape
+        label_shape = (None,)+self.nb_classes
+
+        feat_dset, label_dset = create_arrays(f, ['test_features', 'test_labels'],
+                                              [data_shape, label_shape])
+        self.run_epoch(datagen, model, feat_dset)
+
+        file_names = [fname.split('/')[-1] for fname in datagen.filenames]
+        name_dset = f.create_dataset("test_names", data=file_names)
+
+
+class DataSaver():
+    def __init__(self, path_folder, 
+                 gen=image.ImageDataGenerator(dim_ordering="tf"), 
+                 batch_size=64, target_size=(224,224)):
+        self.path = path_folder
+        self.gen = gen
+        self.results_path = self.path+'results/'
+
+        self.batch_size = batch_size
+        self.target_size = target_size
+
+    def save_images(self, f, split_names=['train', 'valid']):
+        for split_name in split_names:
+            if(split_name=='train'):
+                gen = self.gen
+            else:
+                gen = image.ImageDataGenerator(dim_ordering="tf")
+            path_name = self.path+split_name+'/'
+            datagen = gen.flow_from_directory(path_name, 
+                                              target_size=self.target_size,
+                                              batch_size=self.batch_size, 
+                                              shuffle=False)
+            data_shape = (None,)+datagen.image_shape
+            label_shape = (None,)+(datagen.nb_class,)
+
+            data_dset, label_dset = create_arrays(f, [split_name+'_data', split_name+'_labels'], 
+                                                  [data_shape, label_shape])
+            for data, labels in get_batches(datagen):
+                append_array(data_dset, data)
+                if(split_name!='test'):
+                    append_array(label_dset, labels)
+
+    def save_train(self, fname='dataset.h5'):
+        f = h5py.File(self.results_path+fname, 'w')
+        self.save_images(f, split_names=['train'])
+
+    def save_trainval(self, fname='dataset.h5'):
+        f = h5py.File(self.results_path+fname, 'w')
+        self.save_images(f, split_names=['train', 'valid'])
+
+    def save_all(self, fname='dataset.h5'):
+        f = h5py.File(self.results_path+fname, 'w')
+        self.save_images(f, split_names=['train', 'valid', 'test'])
 
 def mk_size(img, r2c):
     r,c,_ = img.shape
